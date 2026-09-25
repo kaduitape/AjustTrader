@@ -1,0 +1,17 @@
+services:
+  ajuste-de-lotes:
+    build: .
+    container_name: ajuste-de-lotes
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      NODE_ENV: production
+      JWT_SECRET: ${JWT_SECRET:-troque-esta-chave-antes-de-publicar}
+      DATABASE_PATH: ./data/ajuste.db
+    volumes:
+      - ajuste_data:/app/server/data
+
+volumes:
+  ajuste_data:
