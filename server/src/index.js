@@ -9,7 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { db, migrate, getSettings } from './db.js';
-import { adjustmentBalance, calculateAdjustment, calculateOperation, combinedImpact, enrichAdjustmentSuggestions, proportionalTickTargets } from './calculations.js';
+import { calculateAdjustment, calculateFinancialReset, calculateOperation, combinedImpact, enrichAdjustmentSuggestions } from './calculations.js';
 
 migrate();
 
@@ -164,6 +164,7 @@ const adjustmentCalcSchema = z.object({
   referenceStopTicks: z.coerce.number().int().positive().optional(),
   mesaContracts: z.coerce.number().int().min(0).optional(),
   realLots: z.union([z.string(), z.number()]).transform(String).optional(),
+  operationId: z.coerce.number().int().positive().optional(),
 }).superRefine((data, ctx) => {
   if (data.mode === 'keep_ticks' && !data.ticks) ctx.addIssue({ code: 'custom', path: ['ticks'], message: 'Informe os ticks.' });
   if (data.mode === 'keep_quantity' && !data.quantity) ctx.addIssue({ code: 'custom', path: ['quantity'], message: 'Informe a quantidade.' });
@@ -175,7 +176,21 @@ const adjustmentCalcSchema = z.object({
 app.post('/api/calculate-adjustment', auth, (req, res) => {
   const data = adjustmentCalcSchema.parse(req.body);
   const settings = getSettings(req.userId);
-  res.json(enrichAdjustmentSuggestions(calculateAdjustment(data, settings), data, settings));
+  if (!data.operationId) return res.json(enrichAdjustmentSuggestions(calculateAdjustment(data, settings), data, settings));
+  const operation = db.prepare('SELECT * FROM operations WHERE id = ? AND user_id = ?').get(data.operationId, req.userId);
+  if (!operation) return res.status(404).json({ error: 'Operação não encontrada.' });
+  const previousAccumulated = db.prepare('SELECT realized_value FROM adjustments WHERE operation_id = ? AND user_id = ? AND market = ? ORDER BY id')
+    .all(operation.id, req.userId, data.market).reduce((sum, row) => sum.plus(row.realized_value), new Decimal(0));
+  const resultAccumulated = previousAccumulated.plus(data.realized);
+  const metaTake = data.market === 'mesa' ? operation.mesa_take : operation.real_take;
+  const metaStop = data.market === 'mesa' ? operation.mesa_stop : operation.real_stop;
+  const target = data.targetField?.toLowerCase().includes('stop') ? metaStop : metaTake;
+  const calculationInput = {
+    ...data, target, realized: resultAccumulated.toFixed(2), previousAccumulated: previousAccumulated.toFixed(2),
+    resultAccumulated: resultAccumulated.toFixed(2), metaTake, metaStop,
+    mesaContracts: operation.mesa_contracts, realLots: operation.real_lots,
+  };
+  res.json(enrichAdjustmentSuggestions(calculateAdjustment(calculationInput, settings), calculationInput, settings));
 });
 
 app.post('/api/calculate-combined', auth, (req, res) => {
@@ -195,13 +210,41 @@ function adjustmentFromRow(row) {
     suggestedMesaContracts: row.suggested_mesa_contracts, suggestedRealLots: row.suggested_real_lots,
     suggestedTakeTicks: row.suggested_take_ticks, suggestedStopTicks: row.suggested_stop_ticks,
     predictedResult: row.predicted_result, difference: row.difference, notes: row.notes, createdAt: row.created_at,
+    resultAccumulated: row.result_accumulated, metaTake: row.meta_take_value, metaStop: row.meta_stop_value,
+    takeNeeded: row.take_needed, stopNeeded: row.stop_needed, takeResult: row.take_result, stopResult: row.stop_result,
+    finalTake: row.final_take, finalStop: row.final_stop, takeDifference: row.take_difference, stopDifference: row.stop_difference,
   };
 }
 
+function adjustmentHistory(operation, rows, settings) {
+  const running = { mesa: new Decimal(0), real: new Decimal(0) };
+  return rows.map((row) => {
+    running[row.market] = running[row.market].plus(row.realized_value);
+    const metaTake = row.market === 'mesa' ? operation.mesa_take : operation.real_take;
+    const metaStop = row.market === 'mesa' ? operation.mesa_stop : operation.real_stop;
+    const calculated = calculateFinancialReset({
+      metaTake, metaStop, resultAccumulated: running[row.market], market: row.market, quantity: row.suggested_quantity,
+    }, settings);
+    const stored = adjustmentFromRow(row);
+    const hasResetSnapshot = row.result_accumulated !== null && row.result_accumulated !== undefined;
+    const reset = hasResetSnapshot ? stored : calculated;
+    const takeTarget = row.target_field.toLowerCase().includes('take');
+    return {
+      ...stored, ...reset,
+      balance: takeTarget ? reset.takeNeeded : reset.stopNeeded,
+      predictedResult: takeTarget ? reset.takeResult : reset.stopResult,
+      difference: takeTarget ? reset.takeDifference : reset.stopDifference,
+      suggestedTakeTicks: reset.takeTicks ?? row.suggested_take_ticks,
+      suggestedStopTicks: reset.stopTicks ?? row.suggested_stop_ticks,
+    };
+  }).reverse();
+}
+
 app.get('/api/operations/:id/adjustments', auth, (req, res) => {
-  const owns = db.prepare('SELECT 1 FROM operations WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
-  if (!owns) return res.status(404).json({ error: 'Operação não encontrada.' });
-  res.json(db.prepare('SELECT * FROM adjustments WHERE operation_id = ? AND user_id = ? ORDER BY id DESC').all(req.params.id, req.userId).map(adjustmentFromRow));
+  const operation = db.prepare('SELECT * FROM operations WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
+  if (!operation) return res.status(404).json({ error: 'Operação não encontrada.' });
+  const rows = db.prepare('SELECT * FROM adjustments WHERE operation_id = ? AND user_id = ? ORDER BY id').all(req.params.id, req.userId);
+  res.json(adjustmentHistory(operation, rows, getSettings(req.userId)));
 });
 
 const saveAdjustmentSchema = z.object({
@@ -221,30 +264,35 @@ app.post('/api/operations/:id/adjustments', auth, (req, res) => {
   const data = saveAdjustmentSchema.parse(req.body);
   const expectedTarget = operation[data.targetField.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`)];
   if (!new Decimal(data.targetValue).eq(expectedTarget)) return res.status(400).json({ error: 'A meta informada não corresponde à operação original.' });
-  const balance = adjustmentBalance(data.targetValue, data.realizedValue);
   const settings = getSettings(req.userId);
   const suggestedQuantity = new Decimal(data.suggestedQuantity);
   if (data.market === 'mesa' && (!suggestedQuantity.isInteger() || suggestedQuantity.lessThan(1))) {
     return res.status(400).json({ error: 'Contratos MNQ devem ser inteiros e positivos.' });
   }
   if (data.market === 'real') validateLot(data.suggestedQuantity, settings);
-  const magnitude = data.market === 'mesa'
-    ? new Decimal(data.suggestedTicks).times(suggestedQuantity).times(settings.mnqTickValue)
-    : new Decimal(data.suggestedTicks).times(settings.mnqTickSize).times(suggestedQuantity).times(settings.ustecValuePerPoint);
-  const predictedResult = magnitude.times(new Decimal(balance).isNegative() ? -1 : 1).toDecimalPlaces(2).toFixed(2);
-  const difference = new Decimal(predictedResult).minus(balance).toDecimalPlaces(2).toFixed(2);
+  const previousAccumulated = db.prepare('SELECT realized_value FROM adjustments WHERE operation_id = ? AND user_id = ? AND market = ? ORDER BY id')
+    .all(operation.id, req.userId, data.market).reduce((sum, row) => sum.plus(row.realized_value), new Decimal(0));
+  const resultAccumulated = previousAccumulated.plus(data.realizedValue);
+  const metaTake = data.market === 'mesa' ? operation.mesa_take : operation.real_take;
+  const metaStop = data.market === 'mesa' ? operation.mesa_stop : operation.real_stop;
+  const reset = calculateFinancialReset({ metaTake, metaStop, resultAccumulated, market: data.market, quantity: data.suggestedQuantity }, settings);
+  const takeTarget = data.targetField.toLowerCase().includes('take');
+  const balance = takeTarget ? reset.takeNeeded : reset.stopNeeded;
+  const predictedResult = takeTarget ? reset.takeResult : reset.stopResult;
+  const difference = takeTarget ? reset.takeDifference : reset.stopDifference;
   const suggestedMesaContracts = data.market === 'mesa' ? data.suggestedQuantity : String(operation.mesa_contracts);
   const suggestedRealLots = data.market === 'real' ? data.suggestedQuantity : operation.real_lots;
-  const { takeTicks: suggestedTakeTicks, stopTicks: suggestedStopTicks } = proportionalTickTargets(
-    data.targetField, data.suggestedTicks, operation.take_ticks, operation.stop_ticks,
-  );
+  const suggestedTakeTicks = reset.takeTicks;
+  const suggestedStopTicks = reset.stopTicks;
   const info = db.transaction(() => {
     const created = db.prepare(`INSERT INTO adjustments (operation_id,user_id,target_field,target_value,realized_value,balance,market,mode,
       suggested_quantity,suggested_ticks,predicted_result,difference,notes,suggested_mesa_contracts,suggested_real_lots,
-      suggested_take_ticks,suggested_stop_ticks) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      suggested_take_ticks,suggested_stop_ticks,result_accumulated,meta_take_value,meta_stop_value,take_needed,stop_needed,
+      take_result,stop_result,final_take,final_stop,take_difference,stop_difference) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(req.params.id, req.userId, data.targetField, data.targetValue, data.realizedValue, balance, data.market, data.mode,
         data.suggestedQuantity, data.suggestedTicks, predictedResult, difference, data.notes, suggestedMesaContracts, suggestedRealLots,
-        suggestedTakeTicks, suggestedStopTicks);
+        suggestedTakeTicks, suggestedStopTicks, reset.resultAccumulated, reset.metaTake, reset.metaStop, reset.takeNeeded, reset.stopNeeded,
+        reset.takeResult, reset.stopResult, reset.finalTake, reset.finalStop, reset.takeDifference, reset.stopDifference);
     db.prepare("UPDATE operations SET status='AJUSTADA', updated_at=CURRENT_TIMESTAMP WHERE id=?").run(req.params.id);
     return created;
   })();

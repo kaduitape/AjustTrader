@@ -1,0 +1,11 @@
+ALTER TABLE adjustments ADD COLUMN result_accumulated TEXT;
+ALTER TABLE adjustments ADD COLUMN meta_take_value TEXT;
+ALTER TABLE adjustments ADD COLUMN meta_stop_value TEXT;
+ALTER TABLE adjustments ADD COLUMN take_needed TEXT;
+ALTER TABLE adjustments ADD COLUMN stop_needed TEXT;
+ALTER TABLE adjustments ADD COLUMN take_result TEXT;
+ALTER TABLE adjustments ADD COLUMN stop_result TEXT;
+ALTER TABLE adjustments ADD COLUMN final_take TEXT;
+ALTER TABLE adjustments ADD COLUMN final_stop TEXT;
+ALTER TABLE adjustments ADD COLUMN take_difference TEXT;
+ALTER TABLE adjustments ADD COLUMN stop_difference TEXT;

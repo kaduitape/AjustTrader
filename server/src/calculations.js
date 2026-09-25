@@ -34,22 +34,37 @@ export function roundToLotStep(value, step, mode = 'nearest') {
   return ratio.toDecimalPlaces(0, rounding).times(step);
 }
 
-export function proportionalTickTargets(targetField, targetTicks, referenceTakeTicks, referenceStopTicks) {
-  const ticks = D(targetTicks);
-  const takeReference = D(referenceTakeTicks);
-  const stopReference = D(referenceStopTicks);
-  if (ticks.lessThanOrEqualTo(0) || takeReference.lessThanOrEqualTo(0) || stopReference.lessThanOrEqualTo(0)) {
-    throw new Error('Ticks de referência devem ser positivos.');
-  }
-  if (String(targetField).toLowerCase().includes('take')) {
-    return {
-      takeTicks: ticks.toDecimalPlaces(0, Decimal.ROUND_HALF_UP).toNumber(),
-      stopTicks: Decimal.max(1, ticks.times(stopReference).div(takeReference).toDecimalPlaces(0, Decimal.ROUND_HALF_UP)).toNumber(),
-    };
-  }
+function closestWholeTicks(needed, valuePerTick) {
+  const exact = D(needed).abs().div(valuePerTick);
+  const floor = Decimal.max(1, exact.floor());
+  const ceil = Decimal.max(1, exact.ceil());
+  const floorDiff = floor.times(valuePerTick).minus(D(needed).abs()).abs();
+  const ceilDiff = ceil.times(valuePerTick).minus(D(needed).abs()).abs();
+  return (floorDiff.lessThan(ceilDiff) ? floor : ceil).toNumber();
+}
+
+export function calculateFinancialReset({ metaTake, metaStop, resultAccumulated, market, quantity }, settings) {
+  const accumulated = D(resultAccumulated);
+  const takeNeeded = D(metaTake).minus(accumulated);
+  const stopNeeded = D(metaStop).minus(accumulated);
+  const valuePerTick = market === 'mesa'
+    ? D(quantity).times(settings.mnqTickValue)
+    : D(quantity).times(settings.mnqTickSize).times(settings.ustecValuePerPoint);
+  if (valuePerTick.lessThanOrEqualTo(0)) throw new Error('A quantidade deve gerar valor por tick positivo.');
+
+  const takeTicks = closestWholeTicks(takeNeeded, valuePerTick);
+  const stopTicks = closestWholeTicks(stopNeeded, valuePerTick);
+  const takeResult = signed(D(takeTicks).times(valuePerTick), takeNeeded);
+  const stopResult = signed(D(stopTicks).times(valuePerTick), stopNeeded);
+  const finalTake = accumulated.plus(takeResult);
+  const finalStop = accumulated.plus(stopResult);
+
   return {
-    takeTicks: Decimal.max(1, ticks.times(takeReference).div(stopReference).toDecimalPlaces(0, Decimal.ROUND_HALF_UP)).toNumber(),
-    stopTicks: ticks.toDecimalPlaces(0, Decimal.ROUND_HALF_UP).toNumber(),
+    resultAccumulated: asString(accumulated), metaTake: asString(metaTake), metaStop: asString(metaStop),
+    takeNeeded: asString(takeNeeded), stopNeeded: asString(stopNeeded), takeTicks, stopTicks,
+    takeResult: asString(takeResult), stopResult: asString(stopResult),
+    finalTake: asString(finalTake), finalStop: asString(finalStop),
+    takeDifference: asString(finalTake.minus(metaTake)), stopDifference: asString(finalStop.minus(metaStop)),
   };
 }
 
@@ -138,22 +153,54 @@ export function calculateAdjustment({ market, target, realized, mode, ticks, qua
 }
 
 export function enrichAdjustmentSuggestions(result, input, settings) {
-  if (!input.targetField || !input.referenceTakeTicks || !input.referenceStopTicks || input.mesaContracts === undefined || input.realLots === undefined) return result;
-  const baselineSigns = { mesaTake: 1, mesaStop: -1, realTake: -1, realStop: 1 };
-  const neededSign = D(result.balance).isNegative() ? -1 : 1;
-  const flip = neededSign === baselineSigns[input.targetField] ? 1 : -1;
+  if (!input.targetField || input.mesaContracts === undefined || input.realLots === undefined || input.metaTake === undefined || input.metaStop === undefined || input.resultAccumulated === undefined) return result;
+  const takeTarget = input.targetField.toLowerCase().includes('take');
+  const inverseSigned = (reference, magnitude) => D(magnitude).times(D(reference).isNegative() ? 1 : -1);
+  const mapped = result.suggestions.map((suggestion) => {
+    const mesaContracts = input.market === 'mesa' ? suggestion.quantity : String(input.mesaContracts);
+    const realLots = input.market === 'real' ? suggestion.quantity : String(input.realLots);
+    const plan = calculateFinancialReset({
+      metaTake: input.metaTake, metaStop: input.metaStop, resultAccumulated: input.resultAccumulated,
+      market: input.market, quantity: suggestion.quantity,
+    }, settings);
+    const mesaTakeMagnitude = D(plan.takeTicks).times(mesaContracts).times(settings.mnqTickValue);
+    const mesaStopMagnitude = D(plan.stopTicks).times(mesaContracts).times(settings.mnqTickValue);
+    const realTakeMagnitude = D(plan.takeTicks).times(settings.mnqTickSize).times(realLots).times(settings.ustecValuePerPoint);
+    const realStopMagnitude = D(plan.stopTicks).times(settings.mnqTickSize).times(realLots).times(settings.ustecValuePerPoint);
+    const impact = input.market === 'mesa' ? {
+      mesaTake: plan.takeResult, mesaStop: plan.stopResult,
+      realTake: asString(inverseSigned(plan.takeResult, realTakeMagnitude)),
+      realStop: asString(inverseSigned(plan.stopResult, realStopMagnitude)),
+    } : {
+      mesaTake: asString(inverseSigned(plan.takeResult, mesaTakeMagnitude)),
+      mesaStop: asString(inverseSigned(plan.stopResult, mesaStopMagnitude)),
+      realTake: plan.takeResult, realStop: plan.stopResult,
+    };
+    const selectedResult = takeTarget ? plan.takeResult : plan.stopResult;
+    const selectedDifference = takeTarget ? plan.takeDifference : plan.stopDifference;
+    const selectedFinal = takeTarget ? plan.finalTake : plan.finalStop;
+    const combinedScore = D(plan.takeDifference).abs().plus(D(plan.stopDifference).abs()).toNumber();
+    return {
+      ...suggestion, ticks: takeTarget ? plan.takeTicks : plan.stopTicks,
+      result: selectedResult, difference: selectedDifference, accumulated: selectedFinal,
+      takeTicks: plan.takeTicks, stopTicks: plan.stopTicks, mesaContracts, realLots, impact, ...plan, combinedScore,
+    };
+  });
+  const enriched = [...new Map(mapped.map((suggestion) => [
+    `${suggestion.quantity}-${suggestion.takeTicks}-${suggestion.stopTicks}`,
+    suggestion,
+  ])).values()]
+    .sort((a, b) => a.combinedScore - b.combinedScore || a.takeTicks - b.takeTicks)
+    .map(({ combinedScore, ...suggestion }) => suggestion);
+
+  const takeNeeded = D(input.metaTake).minus(input.resultAccumulated);
+  const stopNeeded = D(input.metaStop).minus(input.resultAccumulated);
+  const selectedBalance = takeTarget ? takeNeeded : stopNeeded;
   return {
-    ...result,
-    suggestions: result.suggestions.map((suggestion) => {
-      const { takeTicks, stopTicks } = proportionalTickTargets(
-        input.targetField, suggestion.ticks, input.referenceTakeTicks, input.referenceStopTicks,
-      );
-      const mesaContracts = input.market === 'mesa' ? suggestion.quantity : String(input.mesaContracts);
-      const realLots = input.market === 'real' ? suggestion.quantity : String(input.realLots);
-      const baseImpact = calculateOperation({ mesaContracts, realLots, takeTicks, stopTicks }, settings);
-      const impact = Object.fromEntries(Object.entries(baseImpact).map(([key, value]) => [key, asString(D(value).times(flip))]));
-      return { ...suggestion, takeTicks, stopTicks, mesaContracts, realLots, impact };
-    }),
+    ...result, balance: asString(selectedBalance), direction: selectedBalance.isNegative() ? 'NEGATIVA' : selectedBalance.isZero() ? 'NEUTRA' : 'POSITIVA',
+    previousAccumulated: asString(input.previousAccumulated || 0), resultAccumulated: asString(input.resultAccumulated),
+    metaTake: asString(input.metaTake), metaStop: asString(input.metaStop),
+    takeNeeded: asString(takeNeeded), stopNeeded: asString(stopNeeded), suggestions: enriched,
   };
 }
 

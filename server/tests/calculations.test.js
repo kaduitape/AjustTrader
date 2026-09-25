@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { adjustmentBalance, calculateAdjustment, calculateOperation, enrichAdjustmentSuggestions, proportionalTickTargets, roundToLotStep } from '../src/calculations.js';
+import { adjustmentBalance, calculateAdjustment, calculateFinancialReset, calculateOperation, enrichAdjustmentSuggestions, roundToLotStep } from '../src/calculations.js';
 
 const settings = {
   mnqTickSize: '0.25', mnqTickValue: '0.50', ustecValuePerPoint: '1.00',
@@ -39,21 +39,33 @@ test('roundToLotStep nunca gera lote fora do step', () => {
   assert.equal(roundToLotStep('6.6667', '0.1').toFixed(1), '6.7');
 });
 
-test('calcula stop inteiro mantendo a proporção original', () => {
-  assert.deepEqual(proportionalTickTargets('mesaTake', 62, 154, 200), { takeTicks: 62, stopTicks: 81 });
-  assert.deepEqual(proportionalTickTargets('mesaStop', 81, 154, 200), { takeTicks: 62, stopTicks: 81 });
+test('reset financeiro calcula Take e Stop pelas duas metas originais', () => {
+  assert.deepEqual(calculateFinancialReset({ metaTake: '1540', metaStop: '-2000', resultAccumulated: '645', market: 'mesa', quantity: 28 }, settings), {
+    resultAccumulated: '645.00', metaTake: '1540.00', metaStop: '-2000.00',
+    takeNeeded: '895.00', stopNeeded: '-2645.00', takeTicks: 64, stopTicks: 189,
+    takeResult: '896.00', stopResult: '-2646.00', finalTake: '1541.00', finalStop: '-2001.00',
+    takeDifference: '1.00', stopDifference: '-1.00',
+  });
 });
 
-test('projeta os quatro impactos da configuração de ajuste', () => {
+test('reset financeiro preserva sinais quando o acumulado é negativo', () => {
+  const result = calculateFinancialReset({ metaTake: '1540', metaStop: '-2000', resultAccumulated: '-500', market: 'mesa', quantity: 20 }, settings);
+  assert.equal(result.takeNeeded, '2040.00');
+  assert.equal(result.stopNeeded, '-1500.00');
+});
+
+test('projeta os quatro impactos usando o reset financeiro', () => {
   const input = {
-    market: 'mesa', target: '1540', realized: '920', mode: 'keep_quantity', quantity: 20,
-    targetField: 'mesaTake', referenceTakeTicks: 154, referenceStopTicks: 200,
-    mesaContracts: 20, realLots: '4.15',
+    market: 'mesa', target: '1540', realized: '645', mode: 'keep_quantity', quantity: 28,
+    targetField: 'mesaTake', mesaContracts: 20, realLots: '4.15', metaTake: '1540', metaStop: '-2000',
+    resultAccumulated: '645', previousAccumulated: '0',
   };
   const result = enrichAdjustmentSuggestions(calculateAdjustment(input, settings), input, settings);
-  assert.deepEqual(result.suggestions[0], {
-    quantity: '20', ticks: 62, result: '620.00', difference: '0.00', accumulated: '1540.00',
-    takeTicks: 62, stopTicks: 81, mesaContracts: '20', realLots: '4.15',
-    impact: { mesaTake: '620.00', mesaStop: '-810.00', realTake: '-64.33', realStop: '84.04' },
-  });
+  const suggestion = result.suggestions.find((item) => item.quantity === '28');
+  assert.equal(suggestion.takeTicks, 64);
+  assert.equal(suggestion.stopTicks, 189);
+  assert.equal(suggestion.takeResult, '896.00');
+  assert.equal(suggestion.stopResult, '-2646.00');
+  assert.equal(suggestion.finalTake, '1541.00');
+  assert.equal(suggestion.finalStop, '-2001.00');
 });

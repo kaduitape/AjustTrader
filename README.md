@@ -7,10 +7,10 @@ Micro SaaS para planejamento de operações MNQ/USTEC e cálculo algébrico de a
 - Login e cadastro com JWT, senha protegida com bcrypt e dados isolados por usuário.
 - CRUD completo de operações e status.
 - Cálculos de Mesa MNQ e Conta Real USTEC no backend usando `decimal.js`.
-- Ajuste individual por meta, com três modos de cálculo.
+- Ajuste individual por meta, com três modos de cálculo e reset financeiro de Take e Stop.
 - Contratos e ticks MNQ sempre inteiros; lotes USTEC respeitam mínimo, máximo e step.
 - Ajuste combinado para visualizar impacto nos quatro cenários.
-- Histórico de ajustes sem alterar os valores originais.
+- Histórico sequencial: cada resultado realizado entra no acumulado sem alterar as metas originais.
 - Configurações de instrumentos, corretora e locale por usuário.
 - SQLite com migrations automáticas.
 - Interface React responsiva: tabela no desktop e cards no celular.
@@ -62,6 +62,9 @@ Todas as rotas, exceto autenticação e health check, exigem `Authorization: Bea
 
 - Mesa: `ticks × contratos × valor_do_tick`
 - Real: `ticks_MNQ × tamanho_do_tick × lote × valor_por_ponto`
-- Ajuste: `meta - resultado_realizado`
+- Resultado acumulado: soma algébrica de todos os resultados realizados no mesmo mercado.
+- Take necessário: `meta_take_original - resultado_acumulado`
+- Stop necessário: `meta_stop_original - resultado_acumulado`
+- Os ticks de Take e Stop são calculados separadamente pela configuração escolhida; as metas originais nunca são deslocadas.
 
 Valores monetários são serializados como strings decimais. O código nunca usa `Math.abs` para definir o lado financeiro do ajuste; o sinal vem do saldo algébrico.
